@@ -227,10 +227,15 @@ def reconciliation(df):
 
 
 with st.sidebar:
-    st.header("Setup")
-    st.write("No API key required.")
-    st.warning(
-        "Prototype only. Verify extracted figures against the original PDF."
+    st.header("About this tool")
+    st.write(
+        "Extract key financial figures from annual report PDFs, "
+        "review the page evidence behind each result, and export the "
+        "extracted data and review flags to Excel."
+    )
+    st.caption(
+        "Designed for reports from different companies and financial years. "
+        "Always compare results with the source report before relying on them."
     )
 
 company = st.text_input(
