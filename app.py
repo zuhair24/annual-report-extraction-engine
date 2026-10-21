@@ -188,6 +188,53 @@ def extract_with_ai(client, company, pages):
     return results
 
 
+def build_summary_table(df):
+    """Create a wide, readable summary with one column per standard metric."""
+    columns = ["Company", "Period"] + METRICS
+
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    summary_rows = []
+
+    for (company, period), group in df.groupby(
+        ["company", "period"], dropna=False, sort=False
+    ):
+        row = {
+            "Company": company,
+            "Period": period,
+        }
+
+        for metric in METRICS:
+            candidates = group[group["metric"] == metric]
+            formatted_values = []
+
+            for _, candidate in candidates.iterrows():
+                value = str(candidate.get("value", "")).strip()
+                unit = str(candidate.get("unit", "")).strip()
+
+                if not value or value.lower() == "nan":
+                    continue
+
+                if not unit or unit.lower() == "nan":
+                    unit = "Unit not identified"
+
+                display_value = f"{value} ({unit})"
+                if display_value not in formatted_values:
+                    formatted_values.append(display_value)
+
+            if not formatted_values:
+                row[metric] = "Not found"
+            elif len(formatted_values) == 1:
+                row[metric] = formatted_values[0]
+            else:
+                row[metric] = "Multiple candidates: " + " | ".join(formatted_values)
+
+        summary_rows.append(row)
+
+    return pd.DataFrame(summary_rows, columns=columns)
+
+
 def reconciliation(df):
     columns = ["Company", "Period", "Check", "Result", "Details"]
 
@@ -267,8 +314,30 @@ if uploaded is not None and company.strip():
                     "No figures were extracted. Try a text-based PDF."
                 )
             else:
-                st.subheader("Extracted figures")
-                st.dataframe(df, use_container_width=True)
+                st.subheader("Extracted figures summary")
+                st.caption(
+                    "One row per company and reporting period. Each financial "
+                    "metric has its own column; values include detected units. "
+                    "'Not found' means no candidate was extracted, while "
+                    "'Multiple candidates' means the figures need review."
+                )
+                summary_df = build_summary_table(df)
+                st.dataframe(
+                    summary_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                with st.expander("View extracted details and source evidence"):
+                    detail_columns = [
+                        "company", "metric", "reported_label", "value",
+                        "unit", "period", "pdf_page", "evidence", "confidence"
+                    ]
+                    st.dataframe(
+                        df[detail_columns],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                 st.subheader("Reconciliation / review flags")
                 checks = reconciliation(df)
@@ -279,6 +348,11 @@ if uploaded is not None and company.strip():
                 with pd.ExcelWriter(
                     output, engine="openpyxl"
                 ) as writer:
+                    summary_df.to_excel(
+                        writer,
+                        sheet_name="Financial Summary",
+                        index=False
+                    )
                     df.to_excel(
                         writer,
                         sheet_name="Extracted Data",
