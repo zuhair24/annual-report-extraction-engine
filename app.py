@@ -305,38 +305,87 @@ def build_summary_table(df):
 
 
 def reconciliation(df):
-    columns = ["Company", "Period", "Check", "Result", "Details"]
-
+    """Create actionable review flags without calling every repeated row a duplicate."""
+    columns = [
+        "Company", "Period", "Metric / Check", "Status",
+        "Values found", "Source pages", "Recommended action"
+    ]
     if df.empty:
         return pd.DataFrame(columns=columns)
 
     checks = []
-
+    # Evaluate each company and period separately. Multiple entries with the
+    # same value are not conflicts; only distinct values are flagged as competing.
     for (company, period), group in df.groupby(
-        ["company", "period"], dropna=False
+        ["company", "period"], dropna=False, sort=False
     ):
-        for metric, count in group["metric"].value_counts().items():
-            if count > 1:
+        found_metrics = set(group["metric"].dropna().astype(str))
+        for metric in METRICS:
+            candidates = group[group["metric"] == metric].copy()
+            if candidates.empty:
                 checks.append({
                     "Company": company,
                     "Period": period,
-                    "Check": f"Duplicate metric: {metric}",
-                    "Result": "Flagged",
-                    "Details": (
-                        f"{count} candidate values found. "
-                        "Check the correct statement and reporting period."
-                    ),
+                    "Metric / Check": metric,
+                    "Status": "Missing",
+                    "Values found": "None",
+                    "Source pages": "None",
+                    "Recommended action": "Check whether the metric is present in the report and review its statement pages.",
+                })
+                continue
+
+            values = []
+            for _, candidate in candidates.iterrows():
+                value = str(candidate.get("value", "")).strip()
+                unit = str(candidate.get("unit", "")).strip()
+                if not value or value.lower() == "nan":
+                    continue
+                if not unit or unit.lower() == "nan":
+                    unit = "Unit not identified"
+                entry = f"{value} ({unit})"
+                if entry not in values:
+                    values.append(entry)
+
+            pages = sorted({
+                str(int(p)) for p in candidates["pdf_page"].dropna()
+                if str(p).replace(".", "", 1).isdigit()
+            })
+            page_text = ", ".join(pages) if pages else "Not recorded"
+
+            if not values:
+                checks.append({
+                    "Company": company,
+                    "Period": period,
+                    "Metric / Check": metric,
+                    "Status": "Missing",
+                    "Values found": "No usable numeric value",
+                    "Source pages": page_text,
+                    "Recommended action": "Inspect the source evidence and confirm the metric label and numeric columns.",
+                })
+            elif len(values) > 1:
+                checks.append({
+                    "Company": company,
+                    "Period": period,
+                    "Metric / Check": metric,
+                    "Status": "Conflicting candidates",
+                    "Values found": " | ".join(values[:5]),
+                    "Source pages": page_text,
+                    "Recommended action": "Compare the reported labels, statement type, units, and period columns before choosing a value.",
                 })
 
+        # Keep one clear reminder per company-period rather than repeating a
+        # generic manual-review row for every metric.
         checks.append({
             "Company": company,
             "Period": period,
-            "Check": "Financial figures",
-            "Result": "Manual review",
-            "Details": (
-                "Verify values, units, reporting periods, and page evidence "
-                "against the original annual report."
-            ),
+            "Metric / Check": "Overall source verification",
+            "Status": "Manual review",
+            "Values found": "Not automatically reconciled",
+            "Source pages": ", ".join(sorted({
+                str(int(p)) for p in group["pdf_page"].dropna()
+                if str(p).replace(".", "", 1).isdigit()
+            })) or "Not recorded",
+            "Recommended action": "Verify the extracted figures, reporting period, currency/unit, and evidence against the original PDF.",
         })
 
     return pd.DataFrame(checks, columns=columns)
@@ -409,8 +458,13 @@ if uploaded is not None and company.strip():
                     )
 
                 st.subheader("Reconciliation / review flags")
+                st.caption(
+                    "Missing metrics and conflicting extracted values are listed separately. "
+                    "Repeated identical values are not treated as conflicts. These checks "
+                    "do not prove a figure is correct; compare flagged items with the source PDF."
+                )
                 checks = reconciliation(df)
-                st.dataframe(checks, use_container_width=True)
+                st.dataframe(checks, use_container_width=True, hide_index=True)
 
                 output = io.BytesIO()
 
