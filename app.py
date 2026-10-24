@@ -30,10 +30,10 @@ PATTERNS = {
     # in narrative text and note disclosures.
     "Revenue": r"\b(?:revenue from operations|revenue from contracts with customers|total revenue)\b",
     "Profit After Tax": r"\b(?:profit after tax|profit for the year attributable to owners|net profit after tax)\b",
-    "Total Assets": r"^total assets$",
-    "Total Liabilities": r"^total liabilities$",
+    "Total Assets": r"\btotal assets\b",
+    "Total Liabilities": r"\btotal liabilities\b",
     "Total Borrowings": r"\btotal borrowings\b",
-    "Cash and Cash Equivalents": r"^cash and cash equivalents$",
+    "Cash and Cash Equivalents": r"\bcash and cash equivalents\b",
 }
 
 
@@ -179,6 +179,11 @@ def extract_with_ai(client, company, pages):
             # Capture direct standard-metric labels.
             for metric, pattern in PATTERNS.items():
                 for match in re.finditer(pattern, line, re.IGNORECASE):
+                    # Require the metric label to begin the row (allowing common
+                    # table markers) so narrative mentions are not treated as figures.
+                    row_prefix = line[:match.start()].strip(" •|:-–—")
+                    if row_prefix:
+                        continue
                     # Do not treat a sales-and-services subtotal as the standard
                     # Revenue metric when the report separately labels Revenue from Operations.
                     if metric == "Revenue" and re.search(r"\bvalue of sales\s*&\s*services\b", line, re.IGNORECASE):
@@ -187,8 +192,10 @@ def extract_with_ai(client, company, pages):
                     if not amounts:
                         continue
 
-                    context_start = max(0, line_index - 20)
-                    context = " ".join(lines[context_start:min(len(lines), line_index + 7)])
+                    # Prefer unit declarations on the same statement page. Limit
+                    # context to the nearby section rather than the whole report.
+                    context_start = max(0, line_index - 12)
+                    context = " ".join(lines[context_start:min(len(lines), line_index + 4)])
                     unit = _infer_unit(context)
                     if unit == "Unit not identified":
                         unit = page_unit
