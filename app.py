@@ -26,12 +26,14 @@ METRICS = [
 ]
 
 PATTERNS = {
-    "Revenue": r"\b(?:revenue from operations|total revenue|revenue)\b",
-    "Profit After Tax": r"\b(?:profit after tax|net profit after tax|net profit)\b",
-    "Total Assets": r"\btotal assets\b",
-    "Total Liabilities": r"\btotal liabilities\b",
-    "Total Borrowings": r"\b(?:total borrowings|total borrowings and lease liabilities)\b",
-    "Cash and Cash Equivalents": r"\bcash and cash equivalents\b",
+    # Prefer specific statement labels. Broad "revenue" matches are too noisy
+    # in narrative text and note disclosures.
+    "Revenue": r"\b(?:revenue from operations|revenue from contracts with customers|total revenue)\b",
+    "Profit After Tax": r"\b(?:profit after tax|profit for the year attributable to owners|net profit after tax)\b",
+    "Total Assets": r"^total assets$",
+    "Total Liabilities": r"^total liabilities$",
+    "Total Borrowings": r"\btotal borrowings\b",
+    "Cash and Cash Equivalents": r"^cash and cash equivalents$",
 }
 
 
@@ -68,16 +70,15 @@ def _infer_unit(context):
 
 
 def _infer_period(lines, line_index=None):
-    """Use an explicit date/year found on the page; avoid guessing from the machine date."""
-    context = " ".join(lines if line_index is None else lines[max(0, line_index - 20):line_index + 1])
+    """Prefer explicit statement date headers near the metric row."""
+    context = " ".join(lines if line_index is None else lines[max(0, line_index - 8):line_index + 1])
     patterns = [
-        r"\bFY\s*20\d{2}(?:\s*[-–/]\s*(?:20)?\d{2})?\b",
-        r"\b(?:year ended|year ending|as at|as of|for the year ended)\s*"
+        r"\bFY\s*20\d{2}\s*[-–/]\s*(?:20)?\d{2}\b",
+        r"\b(?:year ended|as at|as of|for the year ended)\s*"
         r"(?:31(?:st|nd|rd|th)?\s+March|March\s+31(?:st|nd|rd|th)?|"
         r"31(?:st|nd|rd|th)?\s+December|December\s+31(?:st|nd|rd|th)?)"
-        r"[,]?\s*(20\d{2})\b",
+        r"[,]?\s*20\d{2}\b",
         r"\b(20\d{2}\s*[-–/]\s*(?:20)?\d{2})\b",
-        r"\b(31(?:st|nd|rd|th)?\s+March\s+20\d{2}|March\s+31(?:st|nd|rd|th)?,?\s+20\d{2})\b",
     ]
     for pattern in patterns:
         matches = list(re.finditer(pattern, context, re.IGNORECASE))
@@ -124,9 +125,15 @@ def _extract_amounts(text):
 
 
 def _row_amounts(lines, line_index, match_end):
-    """Read amounts from a labelled row, including PDFs that put values on following lines."""
-    same_line = _extract_amounts(lines[line_index][match_end:])
-    evidence_lines = [lines[line_index]]
+    """Read amounts only from a likely financial table row, rejecting narrative percentages."""
+    label_line = lines[line_index]
+    suffix = label_line[match_end:]
+    # Reject prose/growth callouts such as "REVENUE ↑ 7.9%" and rows with
+    # percentages, which are not the requested currency amounts.
+    if re.search(r"[↑↓%]|\b(?:growth|increase|decrease|margin|同比)\b", label_line, re.IGNORECASE):
+        return [], label_line
+    same_line = _extract_amounts(suffix)
+    evidence_lines = [label_line]
     amounts = same_line
 
     if not amounts:
@@ -247,50 +254,54 @@ def extract_with_ai(client, company, pages):
     return results
 
 def build_summary_table(df):
-    """Create a wide, readable summary with one column per standard metric."""
+    """Show one company-level row, prioritising the latest explicit reporting period."""
     columns = ["Company", "Period"] + METRICS
-
     if df.empty:
         return pd.DataFrame(columns=columns)
 
-    summary_rows = []
+    working = df.copy()
+    # Avoid one summary row per unrelated date found throughout the report.
+    years = working["period"].astype(str).str.findall(r"20\d{2}")
+    working["_period_year"] = years.apply(lambda values: max(map(int, values)) if values else 0)
+    company = str(working.iloc[0].get("company", ""))
+    best_year = int(working["_period_year"].max())
+    current = working[working["_period_year"] == best_year] if best_year else working
+    period_values = [p for p in current["period"].astype(str).unique() if p and p != "Not identified"]
+    period = period_values[0] if len(period_values) == 1 else (f"Latest identified year: {best_year}" if best_year else "Not identified")
 
-    for (company, period), group in df.groupby(
-        ["company", "period"], dropna=False, sort=False
-    ):
-        row = {
-            "Company": company,
-            "Period": period,
-        }
-
-        for metric in METRICS:
-            candidates = group[group["metric"] == metric]
-            formatted_values = []
-
-            for _, candidate in candidates.iterrows():
-                value = str(candidate.get("value", "")).strip()
-                unit = str(candidate.get("unit", "")).strip()
-
-                if not value or value.lower() == "nan":
-                    continue
-
-                if not unit or unit.lower() == "nan":
-                    unit = "Unit not identified"
-
-                display_value = f"{value} ({unit})"
-                if display_value not in formatted_values:
-                    formatted_values.append(display_value)
-
-            if not formatted_values:
-                row[metric] = "Not found"
-            elif len(formatted_values) == 1:
-                row[metric] = formatted_values[0]
-            else:
-                row[metric] = "Multiple candidates: " + " | ".join(formatted_values)
-
-        summary_rows.append(row)
-
-    return pd.DataFrame(summary_rows, columns=columns)
+    row = {"Company": company, "Period": period}
+    for metric in METRICS:
+        candidates = current[current["metric"] == metric].copy()
+        # Prefer explicit balance-sheet / income-statement labels over broad
+        # labels, and do not display duplicates as if they were a single answer.
+        if not candidates.empty:
+            candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
+                lambda label: 0 if label in {
+                    "revenue from operations", "profit after tax", "total assets",
+                    "total liabilities", "cash and cash equivalents", "total borrowings"
+                } else 1
+            )
+            candidates = candidates.sort_values(
+                ["_label_rank", "pdf_page"], ascending=[True, True]
+            )
+        unique = []
+        for _, candidate in candidates.iterrows():
+            value = str(candidate.get("value", "")).strip()
+            unit = str(candidate.get("unit", "")).strip()
+            if not value or value.lower() == "nan":
+                continue
+            if not unit or unit.lower() == "nan":
+                unit = "Unit not identified"
+            display = f"{value} ({unit})"
+            if display not in unique:
+                unique.append(display)
+        if not unique:
+            row[metric] = "Not found"
+        elif len(unique) == 1:
+            row[metric] = unique[0]
+        else:
+            row[metric] = "Review required: " + " | ".join(unique[:3])
+    return pd.DataFrame([row], columns=columns)
 
 
 def reconciliation(df):
