@@ -27,7 +27,7 @@ METRICS = [
 
 PATTERNS = {
     "Revenue": r"\b(?:revenue from operations|total revenue|revenue)\b",
-    "Profit After Tax": r"\b(?:profit after tax|profit for the year|net profit after tax|net profit)\b",
+    "Profit After Tax": r"\b(?:profit after tax|net profit after tax|net profit)\b",
     "Total Assets": r"\btotal assets\b",
     "Total Liabilities": r"\btotal liabilities\b",
     "Total Borrowings": r"\b(?:total borrowings|total borrowings and lease liabilities)\b",
@@ -172,6 +172,10 @@ def extract_with_ai(client, company, pages):
             # Capture direct standard-metric labels.
             for metric, pattern in PATTERNS.items():
                 for match in re.finditer(pattern, line, re.IGNORECASE):
+                    # Do not treat a sales-and-services subtotal as the standard
+                    # Revenue metric when the report separately labels Revenue from Operations.
+                    if metric == "Revenue" and re.search(r"\bvalue of sales\s*&\s*services\b", line, re.IGNORECASE):
+                        continue
                     amounts, evidence_line = _row_amounts(lines, line_index, match.end())
                     if not amounts:
                         continue
