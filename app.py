@@ -52,13 +52,12 @@ def _clean_line(text):
 
 
 def _infer_unit(context):
-    """Return a unit only when the PDF text gives a clear indication."""
+    """Detect common financial-statement units from nearby or page-level text."""
     checks = [
-        (r"₹\s*(?:in\s*)?crores?|INR\s*(?:in\s*)?crores?", "INR crore"),
-        (r"₹\s*(?:in\s*)?lakhs?|INR\s*(?:in\s*)?lakhs?", "INR lakh"),
-        (r"₹\s*(?:in\s*)?millions?|INR\s*(?:in\s*)?millions?", "INR million"),
-        (r"₹\s*(?:in\s*)?billions?|INR\s*(?:in\s*)?billions?", "INR billion"),
-        (r"\bUSD\s*(?:in\s*)?millions?\b|\$\s*(?:in\s*)?millions?", "USD million"),
+        (r"\(\s*(?:₹|C)\s*in\s*crores?\s*\)|\bINR\s*(?:in\s*)?crores?\b|₹\s*in\s*crores?", "INR crore"),
+        (r"\(\s*(?:₹|C)\s*in\s*lakhs?\s*\)|\bINR\s*(?:in\s*)?lakhs?\b|₹\s*in\s*lakhs?", "INR lakh"),
+        (r"\(\s*(?:₹|C)\s*in\s*millions?\s*\)|\bINR\s*(?:in\s*)?millions?\b|₹\s*in\s*millions?", "INR million"),
+        (r"\bUSD\s*(?:in\s*)?millions?\b|\$\s*in\s*millions?", "USD million"),
         (r"\bUSD\b|\$", "USD"),
         (r"\bINR\b|\bRs\.?\b|₹", "INR"),
     ]
@@ -68,16 +67,17 @@ def _infer_unit(context):
     return "Unit not identified"
 
 
-def _infer_period(lines, line_index):
-    """Use a nearby explicit financial-year/date header; don't guess if absent."""
-    start = max(0, line_index - 12)
-    context = " ".join(lines[start:line_index + 1])
+def _infer_period(lines, line_index=None):
+    """Use an explicit date/year found on the page; avoid guessing from the machine date."""
+    context = " ".join(lines if line_index is None else lines[max(0, line_index - 20):line_index + 1])
     patterns = [
         r"\bFY\s*20\d{2}(?:\s*[-–/]\s*(?:20)?\d{2})?\b",
         r"\b(?:year ended|year ending|as at|as of|for the year ended)\s*"
-        r"(?:31\s+March|March\s+31|31\s+December|December\s+31)?[,]?\s*(20\d{2})\b",
+        r"(?:31(?:st|nd|rd|th)?\s+March|March\s+31(?:st|nd|rd|th)?|"
+        r"31(?:st|nd|rd|th)?\s+December|December\s+31(?:st|nd|rd|th)?)"
+        r"[,]?\s*(20\d{2})\b",
         r"\b(20\d{2}\s*[-–/]\s*(?:20)?\d{2})\b",
-        r"\b(31\s+March\s+20\d{2}|March\s+31,?\s+20\d{2})\b",
+        r"\b(31(?:st|nd|rd|th)?\s+March\s+20\d{2}|March\s+31(?:st|nd|rd|th)?,?\s+20\d{2})\b",
     ]
     for pattern in patterns:
         matches = list(re.finditer(pattern, context, re.IGNORECASE))
@@ -87,7 +87,7 @@ def _infer_period(lines, line_index):
 
 
 def _extract_amounts(text):
-    """Find numeric amounts, excluding common note references and dates."""
+    """Find amounts while filtering dates and leaving note-number handling to the row parser."""
     text = re.sub(
         r"\(?\s*(?:refer to )?notes?\s*\d+[a-z]?\s*\)?",
         " ",
@@ -95,7 +95,8 @@ def _extract_amounts(text):
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"\b(?:31\s+March|March\s+31|31\s+December|December\s+31)"
+        r"\b(?:31(?:st|nd|rd|th)?\s+March|March\s+31(?:st|nd|rd|th)?|"
+        r"31(?:st|nd|rd|th)?\s+December|December\s+31(?:st|nd|rd|th)?)"
         r"[,]?\s*20\d{2}\b",
         " ",
         text,
@@ -111,7 +112,6 @@ def _extract_amounts(text):
     amounts = []
     for match in number_pattern.finditer(text):
         raw = match.group(0).strip()
-        # Ignore standalone years and tiny note/index numbers.
         bare = re.sub(r"^(?:₹|Rs\.?|INR|USD|\$)\s*", "", raw, flags=re.IGNORECASE)
         bare = bare.strip().strip("()").replace(",", "").replace(" ", "")
         if not bare or not re.fullmatch(r"-?\d+(?:\.\d+)?", bare):
@@ -119,18 +119,45 @@ def _extract_amounts(text):
         numeric = float(bare)
         if 1900 <= numeric <= 2099 and "." not in bare:
             continue
-        if abs(numeric) < 1 and "." not in bare:
-            continue
         amounts.append((raw, bare))
     return amounts
 
 
+def _row_amounts(lines, line_index, match_end):
+    """Read amounts from a labelled row, including PDFs that put values on following lines."""
+    same_line = _extract_amounts(lines[line_index][match_end:])
+    evidence_lines = [lines[line_index]]
+    amounts = same_line
+
+    if not amounts:
+        following = []
+        for next_line in lines[line_index + 1:line_index + 7]:
+            # A numeric-only line may be a note number or a financial column.
+            if re.search(r"[A-Za-z]{2,}", next_line):
+                break
+            if next_line.strip():
+                following.append(next_line.strip())
+        if following:
+            amounts = _extract_amounts(" ".join(following))
+            evidence_lines.extend(following)
+
+    # Annual-report tables commonly place a note reference (e.g. 25) before
+    # current-year and prior-year values. If three or more numbers exist and
+    # the first is a small integer, treat it as the note reference.
+    if len(amounts) >= 3:
+        first = amounts[0][1]
+        if re.fullmatch(r"\d{1,2}", first):
+            amounts = amounts[1:]
+
+    return amounts, " | ".join(evidence_lines)
+
+
 def extract_with_ai(client, company, pages):
-    # Local, line-based extraction; no API key is needed.
-    # It prefers amounts on the same financial-statement row as the label,
-    # rather than the first number anywhere in a large text window.
+    # Local, rule-based extraction; no API key is needed.
+    # Values are selected from labelled rows, with note references skipped.
     results = []
     seen = set()
+    borrowings_by_page = {}
 
     for page_num, page_text in pages:
         if not page_text.strip():
@@ -138,55 +165,82 @@ def extract_with_ai(client, company, pages):
 
         lines = [_clean_line(line) for line in page_text.splitlines()]
         lines = [line for line in lines if line]
+        page_unit = _infer_unit(page_text)
+        page_period = _infer_period(lines)
 
         for line_index, line in enumerate(lines):
+            # Capture direct standard-metric labels.
             for metric, pattern in PATTERNS.items():
                 for match in re.finditer(pattern, line, re.IGNORECASE):
-                    # Only inspect the text after the matched label on this row.
-                    suffix = line[match.end():]
-                    amounts = _extract_amounts(suffix)
-                    evidence_line = line
-
-                    # Some PDFs place the label and numeric columns on adjacent
-                    # lines. Only use short, number-led following lines as fallback.
-                    if not amounts:
-                        following = []
-                        for next_line in lines[line_index + 1:line_index + 4]:
-                            if re.search(r"[A-Za-z]{3,}", next_line):
-                                break
-                            following.append(next_line)
-                        if following:
-                            candidate_text = " ".join(following)
-                            amounts = _extract_amounts(candidate_text)
-                            if amounts:
-                                evidence_line = line + " | " + " | ".join(following)
-
+                    amounts, evidence_line = _row_amounts(lines, line_index, match.end())
                     if not amounts:
                         continue
 
+                    # Use the first financial value, which is normally the latest
+                    # period in statements ordered current year then prior year.
                     raw_value, value = amounts[0]
-                    # Avoid duplicating the same metric/amount/page candidate.
+                    context_start = max(0, line_index - 20)
+                    context = " ".join(lines[context_start:min(len(lines), line_index + 7)])
+                    unit = _infer_unit(context)
+                    if unit == "Unit not identified":
+                        unit = page_unit
+
                     key = (page_num, metric, value, evidence_line)
                     if key in seen:
                         continue
                     seen.add(key)
 
-                    context_start = max(0, line_index - 12)
-                    context = " ".join(lines[context_start:min(len(lines), line_index + 3)])
                     results.append({
                         "company": company,
                         "metric": metric,
                         "reported_label": match.group(0),
                         "value": value,
-                        "unit": _infer_unit(context),
-                        "period": _infer_period(lines, line_index),
+                        "unit": unit,
+                        "period": page_period,
                         "pdf_page": page_num,
                         "evidence": evidence_line[:500],
                         "confidence": "Review required",
                     })
 
-    return results
+            # Track current and non-current Borrowings rows so a total can be
+            # calculated when the report does not state "Total Borrowings".
+            if re.fullmatch(r"borrowings", line, re.IGNORECASE):
+                amounts, evidence_line = _row_amounts(lines, line_index, len(line))
+                if amounts:
+                    borrowings_by_page.setdefault(page_num, []).append({
+                        "value": amounts[0][1],
+                        "evidence": evidence_line,
+                        "unit": page_unit,
+                        "period": page_period,
+                    })
 
+    # Derive total borrowings only when exactly two labelled Borrowings rows
+    # occur on one page (typically non-current plus current borrowings).
+    explicit_borrowings = [r for r in results if r["metric"] == "Total Borrowings"]
+    if not explicit_borrowings:
+        for page_num, rows in borrowings_by_page.items():
+            if len(rows) != 2:
+                continue
+            try:
+                total = sum(float(row["value"]) for row in rows)
+            except ValueError:
+                continue
+            first = rows[0]
+            results.append({
+                "company": company,
+                "metric": "Total Borrowings",
+                "reported_label": "Borrowings (non-current + current)",
+                "value": str(int(total)) if total.is_integer() else str(total),
+                "unit": first["unit"],
+                "period": first["period"],
+                "pdf_page": page_num,
+                "evidence": "Derived from two Borrowings rows: " + " | ".join(
+                    row["evidence"] for row in rows
+                ),
+                "confidence": "Derived; verify both components",
+            })
+
+    return results
 
 def build_summary_table(df):
     """Create a wide, readable summary with one column per standard metric."""
