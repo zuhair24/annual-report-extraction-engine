@@ -187,31 +187,60 @@ def extract_with_ai(client, company, pages):
                     if not amounts:
                         continue
 
-                    # Use the first financial value, which is normally the latest
-                    # period in statements ordered current year then prior year.
-                    raw_value, value = amounts[0]
                     context_start = max(0, line_index - 20)
                     context = " ".join(lines[context_start:min(len(lines), line_index + 7)])
                     unit = _infer_unit(context)
                     if unit == "Unit not identified":
                         unit = page_unit
 
-                    key = (page_num, metric, value, evidence_line)
-                    if key in seen:
-                        continue
-                    seen.add(key)
+                    # Preserve multiple values from a financial row rather than
+                    # silently discarding the comparative column. Periods are
+                    # assigned only when explicit year labels are visible nearby;
+                    # otherwise the candidate is marked as needing period review.
+                    nearby = " ".join(lines[max(0, line_index - 8):min(len(lines), line_index + 2)])
+                    year_matches = re.findall(
+                        r"\b(?:FY\s*)?(20\d{2}\s*[-–/]\s*(?:20)?\d{2}|20\d{2})\b",
+                        nearby,
+                        re.IGNORECASE,
+                    )
+                    row_periods = []
+                    for year_label in year_matches:
+                        normalized = _clean_line(year_label)
+                        if normalized not in row_periods:
+                            row_periods.append(normalized)
 
-                    results.append({
-                        "company": company,
-                        "metric": metric,
-                        "reported_label": match.group(0),
-                        "value": value,
-                        "unit": unit,
-                        "period": page_period,
-                        "pdf_page": page_num,
-                        "evidence": evidence_line[:500],
-                        "confidence": "Review required",
-                    })
+                    # For two numeric columns, only map them to years when two
+                    # explicit year labels are present in nearby statement headers.
+                    period_for_values = []
+                    if len(amounts) >= 2 and len(row_periods) >= 2:
+                        period_for_values = row_periods[:len(amounts)]
+                    elif len(amounts) == 1:
+                        period_for_values = [page_period]
+                    else:
+                        period_for_values = ["Period unclear"] * len(amounts)
+
+                    for amount_index, (raw_value, value) in enumerate(amounts):
+                        candidate_period = period_for_values[amount_index]
+                        key = (page_num, metric, value, candidate_period, evidence_line)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        results.append({
+                            "company": company,
+                            "metric": metric,
+                            "reported_label": match.group(0),
+                            "value": value,
+                            "unit": unit,
+                            "period": candidate_period,
+                            "pdf_page": page_num,
+                            "evidence": evidence_line[:500],
+                            "confidence": (
+                                "Review required"
+                                if candidate_period in {"Period unclear", "Not identified"}
+                                else "Review required; period label detected"
+                            ),
+                        })
 
             # Track current and non-current Borrowings rows so a total can be
             # calculated when the report does not state "Total Borrowings".
