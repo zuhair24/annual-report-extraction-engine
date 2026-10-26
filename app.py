@@ -194,23 +194,84 @@ def _convert_to_inr_crore(value, unit, period, metric, cache):
         return None, "Historical rate unavailable"
     return amount * scale * rate, "Converted to INR crore"
 
-def _infer_period(lines, line_index=None):
-    """Prefer explicit statement date headers near the metric row."""
-    context = " ".join(lines if line_index is None else lines[max(0, line_index - 8):line_index + 1])
+def _period_labels(text):
+    """Return distinct explicit reporting periods in the order they appear."""
     patterns = [
         r"\bFY\s*20\d{2}\s*[-–/]\s*(?:20)?\d{2}\b",
         r"\b(?:year ended|as at|as of|for the year ended)\s*"
         r"(?:31(?:st|nd|rd|th)?\s+March|March\s+31(?:st|nd|rd|th)?|"
         r"31(?:st|nd|rd|th)?\s+December|December\s+31(?:st|nd|rd|th)?)"
         r"[,]?\s*20\d{2}\b",
-        r"\b(20\d{2}\s*[-–/]\s*(?:20)?\d{2})\b",
+        r"\b20\d{2}\s*[-–/]\s*(?:20)?\d{2}\b",
+        r"\b20\d{2}\b",
     ]
+    found = []
     for pattern in patterns:
-        matches = list(re.finditer(pattern, context, re.IGNORECASE))
-        if matches:
-            return _clean_line(matches[-1].group(0))
-    return "Not identified"
+        for match in re.finditer(pattern, text, re.I):
+            label = _clean_line(match.group(0))
+            if label not in found:
+                found.append(label)
+        if found:
+            break
+    return found
 
+
+def _infer_period(lines, line_index=None):
+    """Return the nearest explicit reporting period, if one is visible."""
+    context = " ".join(lines if line_index is None else lines[max(0, line_index - 12):line_index + 1])
+    periods = _period_labels(context)
+    return periods[-1] if periods else "Not identified"
+
+
+def _detect_statement_type(lines, line_index, lookback=35):
+    """Identify consolidated vs standalone from the nearest statement heading."""
+    start = max(0, line_index - lookback)
+    for idx in range(line_index, start - 1, -1):
+        line = _clean_line(lines[idx])
+        if re.search(r"\bconsolidated\b", line, re.I):
+            return "Consolidated"
+        if re.search(r"\bstandalone\b|\bstand-alone\b", line, re.I):
+            return "Standalone"
+        if re.search(
+            r"^(?:notes to (?:the )?financial statements|"
+            r"statement of (?:profit or loss|financial position|cash flows)|"
+            r"balance sheet|income statement|cash flow statement)\b",
+            line, re.I
+        ):
+            # Continue past generic statement titles, but stop at a new notes section.
+            if re.search(r"^notes to", line, re.I):
+                break
+    return "Statement type unclear"
+
+
+def _column_periods(lines, line_index, value_count):
+    """Map row values to the ordered year/date headers immediately above the row."""
+    start = max(0, line_index - 18)
+    header_lines = []
+    for idx in range(line_index - 1, start - 1, -1):
+        line = _clean_line(lines[idx])
+        if not line:
+            continue
+        # Stop if we hit another financial metric row; its years are not this row's headers.
+        if any(re.search(pattern, line, re.I) for pattern in PATTERNS.values()):
+            break
+        labels = _period_labels(line)
+        if labels:
+            header_lines.append((idx, labels))
+        if len(header_lines) >= 4:
+            break
+    if not header_lines:
+        return []
+    # Earlier lines usually contain the year-column headings; preserve their left-to-right order.
+    header_lines.reverse()
+    ordered = []
+    for _, labels in header_lines:
+        for label in labels:
+            if label not in ordered:
+                ordered.append(label)
+    if len(ordered) >= value_count:
+        return ordered[-value_count:]
+    return ordered
 
 def _extract_amounts(text):
     """Extract positive numeric table values; ignore percentages, dates, and dash placeholders."""
@@ -329,29 +390,14 @@ def extract_with_ai(client, company, pages):
                     # unrelated text elsewhere on the page.
                     unit = _infer_statement_unit(lines, line_index)
 
-                    # Preserve multiple values from a financial row rather than
-                    # silently discarding the comparative column. Periods are
-                    # assigned only when explicit year labels are visible nearby;
-                    # otherwise the candidate is marked as needing period review.
-                    nearby = " ".join(lines[max(0, line_index - 8):min(len(lines), line_index + 2)])
-                    year_matches = re.findall(
-                        r"\b(?:FY\s*)?(20\d{2}\s*[-–/]\s*(?:20)?\d{2}|20\d{2})\b",
-                        nearby,
-                        re.IGNORECASE,
-                    )
-                    row_periods = []
-                    for year_label in year_matches:
-                        normalized = _clean_line(year_label)
-                        if normalized not in row_periods:
-                            row_periods.append(normalized)
-
-                    # For two numeric columns, only map them to years when two
-                    # explicit year labels are present in nearby statement headers.
-                    period_for_values = []
-                    if len(amounts) >= 2 and len(row_periods) >= 2:
-                        period_for_values = row_periods[:len(amounts)]
-                    elif len(amounts) == 1:
-                        period_for_values = [page_period]
+                    # Map each extracted amount to the actual ordered year/date
+                    # headers above this row, not any year mentioned nearby in prose.
+                    statement_type = _detect_statement_type(lines, line_index)
+                    column_periods = _column_periods(lines, line_index, len(amounts))
+                    if len(amounts) == 1:
+                        period_for_values = [column_periods[0] if column_periods else page_period]
+                    elif len(column_periods) >= len(amounts):
+                        period_for_values = column_periods[:len(amounts)]
                     else:
                         period_for_values = ["Period unclear"] * len(amounts)
 
@@ -361,7 +407,7 @@ def extract_with_ai(client, company, pages):
                             if amount_index < len(period_for_values)
                             else "Period unclear"
                         )
-                        key = (page_num, metric, value, candidate_period, evidence_line)
+                        key = (page_num, metric, value, candidate_period, statement_type, evidence_line)
                         if key in seen:
                             continue
                         seen.add(key)
@@ -373,6 +419,7 @@ def extract_with_ai(client, company, pages):
                             "value": value,
                             "unit": unit,
                             "period": candidate_period,
+                            "statement_type": statement_type,
                             "pdf_page": page_num,
                             "evidence": evidence_line[:500],
                             "confidence": (
@@ -392,6 +439,7 @@ def extract_with_ai(client, company, pages):
                         "evidence": evidence_line,
                         "unit": _infer_statement_unit(lines, line_index),
                         "period": page_period,
+                        "statement_type": _detect_statement_type(lines, line_index),
                     })
 
     # Derive total borrowings only when exactly two labelled Borrowings rows
@@ -413,6 +461,7 @@ def extract_with_ai(client, company, pages):
                 "value": str(int(total)) if total.is_integer() else str(total),
                 "unit": first["unit"],
                 "period": first["period"],
+                "statement_type": first.get("statement_type", "Statement type unclear"),
                 "pdf_page": page_num,
                 "evidence": "Derived from two Borrowings rows: " + " | ".join(
                     row["evidence"] for row in rows
@@ -433,7 +482,7 @@ def extract_with_ai(client, company, pages):
 
 def build_summary_table(df):
     """Show one selected figure per metric, with one shared reporting-period column."""
-    columns = ["Company", "Period"] + METRICS
+    columns = ["Company", "Statement Type", "Period"] + METRICS
     if df.empty:
         return pd.DataFrame(columns=columns)
 
@@ -461,10 +510,20 @@ def build_summary_table(df):
         "Cash and Cash Equivalents": ["cash and cash equivalents"],
     }
 
-    row = {"Company": company}
-    selected_periods = []
-    for metric in METRICS:
-        candidates = working[working["metric"] == metric].copy()
+    statement_types = (
+        working["statement_type"].fillna("Statement type unclear").astype(str).drop_duplicates().tolist()
+        if "statement_type" in working.columns else ["Statement type unclear"]
+    )
+    summary_rows = []
+    for statement_type in statement_types:
+        row = {"Company": company, "Statement Type": statement_type}
+        selected_periods = []
+        for metric in METRICS:
+            candidates = working[working["metric"] == metric].copy()
+            if "statement_type" in candidates.columns:
+                candidates = candidates[
+                    candidates["statement_type"].fillna("Statement type unclear").astype(str) == statement_type
+                ]
         if candidates.empty:
             row[metric] = "Not found"
             continue
@@ -502,15 +561,16 @@ def build_summary_table(df):
         }:
             selected_periods.append(period)
 
-    unique_periods = list(dict.fromkeys(selected_periods))
-    if len(unique_periods) == 1:
-        row["Period"] = unique_periods[0]
-    elif len(unique_periods) > 1:
-        row["Period"] = "Mixed periods; review required"
-    else:
-        row["Period"] = "Not identified"
+        unique_periods = list(dict.fromkeys(selected_periods))
+        if len(unique_periods) == 1:
+            row["Period"] = unique_periods[0]
+        elif len(unique_periods) > 1:
+            row["Period"] = "Mixed periods; review required"
+        else:
+            row["Period"] = "Not identified"
+        summary_rows.append(row)
 
-    return pd.DataFrame([row], columns=columns)
+    return pd.DataFrame(summary_rows, columns=columns)
 
 def reconciliation(df):
     """Create actionable review flags without calling every repeated row a duplicate."""
@@ -652,7 +712,7 @@ if uploaded is not None and company.strip():
 
                 with st.expander("View extracted details and source evidence"):
                     detail_columns = [
-                        "company", "metric", "reported_label", "value",
+                        "company", "statement_type", "metric", "reported_label", "value",
                         "unit", "value_inr_crore", "conversion_status", "period", "pdf_page", "evidence", "confidence"
                     ]
                     st.dataframe(
