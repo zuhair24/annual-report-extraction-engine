@@ -1,5 +1,8 @@
 import io
 import re
+import json
+import urllib.request
+import urllib.error
 
 import fitz
 import pandas as pd
@@ -54,20 +57,88 @@ def _clean_line(text):
 
 
 def _infer_unit(context):
-    """Detect common financial-statement units from nearby or page-level text."""
+    """Infer source currency and scale from statement headings and nearby text."""
     checks = [
-        (r"\(\s*(?:₹|C)\s*in\s*crores?\s*\)|\bC\s+in\s+crores?\b|\bINR\s*(?:in\s*)?crores?\b|₹\s*in\s*crores?", "INR crore"),
-        (r"\(\s*(?:₹|C)\s*in\s*lakhs?\s*\)|\bINR\s*(?:in\s*)?lakhs?\b|₹\s*in\s*lakhs?", "INR lakh"),
-        (r"\(\s*(?:₹|C)\s*in\s*millions?\s*\)|\bINR\s*(?:in\s*)?millions?\b|₹\s*in\s*millions?", "INR million"),
-        (r"\bUSD\s*(?:in\s*)?millions?\b|\$\s*in\s*millions?", "USD million"),
-        (r"\bUSD\b|\$", "USD"),
-        (r"\bINR\b|\bRs\.?\b|₹", "INR"),
+        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?crores?\b|\b(?:in\s*)?crores?\b.{0,25}(?:₹|INR|Rs\.?)", "INR crore"),
+        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?lakhs?\b|\b(?:in\s*)?lakhs?\b.{0,25}(?:₹|INR|Rs\.?)", "INR lakh"),
+        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?thousands?\b|\b(?:in\s*)?thousands?\b.{0,25}(?:₹|INR|Rs\.?)", "INR thousand"),
+        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?millions?\b|\b(?:in\s*)?millions?\b.{0,25}(?:₹|INR|Rs\.?)", "INR million"),
+        (r"\bUSD\b|\$|\bUS dollars?\b", "USD"),
+        (r"\bEUR\b|€|\beuros?\b", "EUR"),
+        (r"\bGBP\b|£|\bpounds sterling\b", "GBP"),
+        (r"\bAED\b", "AED"),
+        (r"\bSGD\b", "SGD"),
+        (r"\bJPY\b|¥", "JPY"),
+        (r"\bCAD\b", "CAD"),
+        (r"\bAUD\b", "AUD"),
+        (r"\bINR\b|\bRs\.?\b|₹|\bindian rupees?\b", "INR"),
     ]
     for pattern, unit in checks:
         if re.search(pattern, context, re.IGNORECASE):
             return unit
     return "Unit not identified"
 
+
+def _historical_inr_rate(currency, period, metric, cache):
+    """Fetch historical FX data without an API key; return INR per source currency."""
+    if currency == "INR":
+        return 1.0
+    years = [int(y) for y in re.findall(r"20\d{2}", str(period))]
+    if not years:
+        return None
+    end_year = max(years)
+    fiscal = bool(re.search(r"FY|20\d{2}\s*[-–/]\s*(?:20)?\d{2}", str(period), re.I))
+    if metric in {"Revenue", "Profit After Tax"}:
+        start = f"{end_year - 1}-04-01" if fiscal else f"{end_year}-01-01"
+        end = f"{end_year}-03-31" if fiscal else f"{end_year}-12-31"
+        key = (currency, start, end, "average")
+    else:
+        end = f"{end_year}-03-31" if fiscal else f"{end_year}-12-31"
+        start = end
+        key = (currency, start, end, "period-end")
+    if key in cache:
+        return cache[key]
+    url = f"https://api.frankfurter.dev/v1/{start}..{end}?from={currency}&to=INR"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "AnnualReportExtractionEngine/1.0"})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        rates = [float(v["INR"]) for v in payload.get("rates", {}).values() if "INR" in v]
+        rate = (sum(rates) / len(rates)) if rates and key[3] == "average" else (rates[-1] if rates else None)
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError):
+        rate = None
+    cache[key] = rate
+    return rate
+
+
+def _convert_to_inr_crore(value, unit, period, metric, cache):
+    """Convert an extracted amount into INR crore while retaining the original."""
+    try:
+        amount = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None, "Conversion unavailable"
+    unit = str(unit or "").strip()
+    scale = 1.0
+    if re.search(r"\bcrore\b", unit, re.I):
+        scale = 1.0
+    elif re.search(r"\blakh\b", unit, re.I):
+        scale = 0.01
+    elif re.search(r"\bthousand\b", unit, re.I):
+        scale = 0.00001
+    elif re.search(r"\bmillion\b", unit, re.I):
+        scale = 0.1
+    elif unit in {"INR", "USD", "EUR", "GBP", "AED", "SGD", "JPY", "CAD", "AUD"}:
+        scale = 0.0000001
+    else:
+        return None, "Currency/unit not identified"
+    currency_match = re.match(r"([A-Z]{3})", unit)
+    currency = currency_match.group(1) if currency_match else ("INR" if unit.startswith("INR") else None)
+    if currency is None:
+        return None, "Currency/unit not identified"
+    rate = _historical_inr_rate(currency, period, metric, cache)
+    if rate is None:
+        return None, "Historical rate unavailable"
+    return amount * scale * rate / 10000000, "Converted to INR crore"
 
 def _infer_period(lines, line_index=None):
     """Prefer explicit statement date headers near the metric row."""
@@ -291,6 +362,15 @@ def extract_with_ai(client, company, pages):
                 "confidence": "Derived; verify both components",
             })
 
+    fx_cache = {}
+    for item in results:
+        converted, status = _convert_to_inr_crore(
+            item.get("value"), item.get("unit"), item.get("period"),
+            item.get("metric"), fx_cache
+        )
+        item["value_inr_crore"] = round(converted, 6) if converted is not None else None
+        item["conversion_status"] = status
+
     return results
 
 def build_summary_table(df):
@@ -351,16 +431,13 @@ def build_summary_table(df):
         )
 
         selected = candidates.iloc[0]
-        value = str(selected.get("value", "")).strip()
-        unit = str(selected.get("unit", "")).strip()
+        converted = selected.get("value_inr_crore")
         period = str(selected.get("period", "")).strip()
 
-        if not value or value.lower() == "nan":
-            row[metric] = "Not found"
+        if pd.isna(converted):
+            row[metric] = "Conversion unavailable; review"
         else:
-            if not unit or unit.lower() == "nan":
-                unit = "Unit not identified"
-            row[metric] = f"{value} ({unit})"
+            row[metric] = f"₹ {converted:,.2f} crore"
 
         if period and period.lower() != "nan" and period not in {
             "Period unclear", "Not identified"
@@ -472,8 +549,7 @@ with st.sidebar:
         "extracted data and review flags to Excel."
     )
     st.caption(
-        "Designed for reports from different companies and financial years. "
-        "Always compare results with the source report before relying on them."
+        "Summary values are shown in INR crore. Foreign-currency conversion uses historical rates when available and flags unavailable rates or units for review. Always verify results against the source report."
     )
 
 company = st.text_input(
@@ -507,9 +583,7 @@ if uploaded is not None and company.strip():
             else:
                 st.subheader("Extracted figures summary")
                 st.caption(
-                    "One selected candidate per metric. Units appear beside each "
-                    "value, with one shared reporting-period column for the table. "
-                    "Check the source evidence before relying on any extracted figure."
+                    "All summary figures are standardised to INR crore. Foreign-currency figures use historical rates when available. Revenue/profit use an annual average rate; balance-sheet figures use a period-end rate. Original values and units remain in the details. Review unavailable conversions against the source PDF."
                 )
                 summary_df = build_summary_table(df)
                 st.dataframe(
@@ -521,7 +595,7 @@ if uploaded is not None and company.strip():
                 with st.expander("View extracted details and source evidence"):
                     detail_columns = [
                         "company", "metric", "reported_label", "value",
-                        "unit", "period", "pdf_page", "evidence", "confidence"
+                        "unit", "value_inr_crore", "conversion_status", "period", "pdf_page", "evidence", "confidence"
                     ]
                     st.dataframe(
                         df[detail_columns],
