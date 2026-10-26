@@ -57,14 +57,10 @@ def _clean_line(text):
 
 
 def _infer_unit(context):
-    """Infer source currency and scale from statement headings and nearby text."""
-    checks = [
-        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?crores?\b|\b(?:in\s*)?crores?\b.{0,25}(?:₹|INR|Rs\.?)", "INR crore"),
-        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?lakhs?\b|\b(?:in\s*)?lakhs?\b.{0,25}(?:₹|INR|Rs\.?)", "INR lakh"),
-        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?thousands?\b|\b(?:in\s*)?thousands?\b.{0,25}(?:₹|INR|Rs\.?)", "INR thousand"),
-        (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?millions?\b|\b(?:in\s*)?millions?\b.{0,25}(?:₹|INR|Rs\.?)", "INR million"),
-        (r"(?:\bUSD\b|\$|\bUS dollars?\b).{0,20}\bmillions?\b|\bmillions?\b.{0,20}(?:\bUSD\b|\$)", "USD million"),
-        (r"(?:\bEUR\b|€|\beuros?\b).{0,20}\bmillions?\b|\bmillions?\b.{0,20}(?:\bEUR\b|€)", "EUR million"),
+    """Infer currency and scale only from a short, explicit unit declaration."""
+    text = _clean_line(str(context or ""))
+    has_inr = bool(re.search(r"\bINR\b|\bRs\.?\b|₹|\bindian rupees?\b|\brupees?\b", text, re.I))
+    currencies = [
         (r"\bUSD\b|\$|\bUS dollars?\b", "USD"),
         (r"\bEUR\b|€|\beuros?\b", "EUR"),
         (r"\bGBP\b|£|\bpounds sterling\b", "GBP"),
@@ -73,13 +69,67 @@ def _infer_unit(context):
         (r"\bJPY\b|¥", "JPY"),
         (r"\bCAD\b", "CAD"),
         (r"\bAUD\b", "AUD"),
-        (r"\bINR\b|\bRs\.?\b|₹|\bindian rupees?\b", "INR"),
     ]
-    for pattern, unit in checks:
-        if re.search(pattern, context, re.IGNORECASE):
-            return unit
+    currency = "INR" if has_inr else next(
+        (code for pattern, code in currencies if re.search(pattern, text, re.I)),
+        None,
+    )
+    scale_checks = [
+        (r"\bcrores?\b", "crore"),
+        (r"\blakhs?\b", "lakh"),
+        (r"\bthousands?\b|\b000s\b", "thousand"),
+        (r"\bmillions?\b", "million"),
+        (r"\bbillions?\b", "billion"),
+    ]
+    scale = next((name for pattern, name in scale_checks if re.search(pattern, text, re.I)), None)
+
+    # Do not assume the currency from an isolated symbol or a nearby number.
+    # The declaration must explicitly identify a currency, or use INR notation.
+    if currency and scale:
+        return f"{currency} {scale}"
+    if currency and re.search(r"\b(?:currency|amounts?|figures?|values?)\b", text, re.I):
+        return currency
+    if currency and re.fullmatch(r"\s*(?:USD|EUR|GBP|AED|SGD|JPY|CAD|AUD|INR)\s*", text, re.I):
+        return currency
     return "Unit not identified"
 
+
+def _infer_statement_unit(lines, line_index, lookback=18):
+    """Use the nearest explicit unit declaration above the row, within its section."""
+    section_break = re.compile(
+        r"^(?:notes to (?:the )?financial statements|"
+        r"statement of (?:profit or loss|financial position|cash flows)|"
+        r"balance sheet|income statement|cash flow statement)\b",
+        re.I,
+    )
+    start = max(0, line_index - lookback)
+    for idx in range(line_index, start - 1, -1):
+        line = _clean_line(lines[idx])
+        if not line:
+            continue
+        if idx != line_index and section_break.search(line):
+            # A new statement heading starts a fresh search area; still inspect
+            # that heading itself on the next iteration.
+            if not re.search(r"\b(?:crores?|lakhs?|thousands?|millions?|billions?)\b", line, re.I):
+                break
+        has_scale = bool(re.search(r"\b(?:crores?|lakhs?|thousands?|millions?|billions?|000s)\b", line, re.I))
+        declaration_like = bool(re.search(
+            r"\b(?:in|amounts?|figures?|values?|expressed|denominated|currency)\b|"
+            r"\b(?:INR|USD|EUR|GBP|AED|SGD|JPY|CAD|AUD)\b|₹|€|£|\$|¥|Rs\.?",
+            line, re.I
+        ))
+        if has_scale and declaration_like:
+            unit = _infer_unit(line)
+            if unit != "Unit not identified":
+                return unit
+        # Permit explicit currency-only headings, but never infer currency from
+        # ordinary financial rows containing values.
+        if not has_scale and re.fullmatch(
+            r"(?:amounts? (?:in|expressed in) )?(?:INR|USD|EUR|GBP|AED|SGD|JPY|CAD|AUD)",
+            line, re.I
+        ):
+            return _infer_unit(line)
+    return "Unit not identified"
 
 def _historical_inr_rate(currency, period, metric, cache):
     """Fetch historical FX data without an API key; return INR per source currency."""
@@ -129,6 +179,8 @@ def _convert_to_inr_crore(value, unit, period, metric, cache):
         scale = 0.00001
     elif re.search(r"\bmillion\b", unit, re.I):
         scale = 0.1
+    elif re.search(r"\bbillion\b", unit, re.I):
+        scale = 10.0
     elif unit in {"INR", "USD", "EUR", "GBP", "AED", "SGD", "JPY", "CAD", "AUD"}:
         scale = 0.0000001
     else:
@@ -253,7 +305,6 @@ def extract_with_ai(client, company, pages):
 
         lines = [_clean_line(line) for line in page_text.splitlines()]
         lines = [line for line in lines if line]
-        page_unit = _infer_unit(page_text)
         page_period = _infer_period(lines)
 
         for line_index, line in enumerate(lines):
@@ -273,13 +324,10 @@ def extract_with_ai(client, company, pages):
                     if not amounts:
                         continue
 
-                    # Prefer unit declarations on the same statement page. Limit
-                    # context to the nearby section rather than the whole report.
-                    context_start = max(0, line_index - 12)
-                    context = " ".join(lines[context_start:min(len(lines), line_index + 4)])
-                    unit = _infer_unit(context)
-                    if unit == "Unit not identified":
-                        unit = page_unit
+                    # Read currency and scale from an explicit declaration above
+                    # this row in the same statement section. Never fall back to
+                    # unrelated text elsewhere on the page.
+                    unit = _infer_statement_unit(lines, line_index)
 
                     # Preserve multiple values from a financial row rather than
                     # silently discarding the comparative column. Periods are
@@ -342,7 +390,7 @@ def extract_with_ai(client, company, pages):
                     borrowings_by_page.setdefault(page_num, []).append({
                         "value": amounts[0][1],
                         "evidence": evidence_line,
-                        "unit": page_unit,
+                        "unit": _infer_statement_unit(lines, line_index),
                         "period": page_period,
                     })
 
