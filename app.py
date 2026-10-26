@@ -56,7 +56,7 @@ def _clean_line(text):
 def _infer_unit(context):
     """Detect common financial-statement units from nearby or page-level text."""
     checks = [
-        (r"\(\s*(?:₹|C)\s*in\s*crores?\s*\)|\bINR\s*(?:in\s*)?crores?\b|₹\s*in\s*crores?", "INR crore"),
+        (r"\(\s*(?:₹|C)\s*in\s*crores?\s*\)|\bC\s+in\s+crores?\b|\bINR\s*(?:in\s*)?crores?\b|₹\s*in\s*crores?", "INR crore"),
         (r"\(\s*(?:₹|C)\s*in\s*lakhs?\s*\)|\bINR\s*(?:in\s*)?lakhs?\b|₹\s*in\s*lakhs?", "INR lakh"),
         (r"\(\s*(?:₹|C)\s*in\s*millions?\s*\)|\bINR\s*(?:in\s*)?millions?\b|₹\s*in\s*millions?", "INR million"),
         (r"\bUSD\s*(?:in\s*)?millions?\b|\$\s*in\s*millions?", "USD million"),
@@ -312,6 +312,11 @@ def build_summary_table(df):
     row = {"Company": company, "Period": period}
     for metric in METRICS:
         candidates = current[current["metric"] == metric].copy()
+        # If the latest-period filter excludes a metric because its period
+        # could not be confidently detected, fall back to its extracted
+        # candidates instead of incorrectly reporting "Not found".
+        if candidates.empty:
+            candidates = working[working["metric"] == metric].copy()
         # Prefer explicit balance-sheet / income-statement labels over broad
         # labels, and do not display duplicates as if they were a single answer.
         if not candidates.empty:
