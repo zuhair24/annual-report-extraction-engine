@@ -63,6 +63,8 @@ def _infer_unit(context):
         (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?lakhs?\b|\b(?:in\s*)?lakhs?\b.{0,25}(?:₹|INR|Rs\.?)", "INR lakh"),
         (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?thousands?\b|\b(?:in\s*)?thousands?\b.{0,25}(?:₹|INR|Rs\.?)", "INR thousand"),
         (r"(?:₹|INR|Rs\.?|rupees?).{0,25}\b(?:in\s*)?millions?\b|\b(?:in\s*)?millions?\b.{0,25}(?:₹|INR|Rs\.?)", "INR million"),
+        (r"(?:\bUSD\b|\$|\bUS dollars?\b).{0,20}\bmillions?\b|\bmillions?\b.{0,20}(?:\bUSD\b|\$)", "USD million"),
+        (r"(?:\bEUR\b|€|\beuros?\b).{0,20}\bmillions?\b|\bmillions?\b.{0,20}(?:\bEUR\b|€)", "EUR million"),
         (r"\bUSD\b|\$|\bUS dollars?\b", "USD"),
         (r"\bEUR\b|€|\beuros?\b", "EUR"),
         (r"\bGBP\b|£|\bpounds sterling\b", "GBP"),
@@ -138,7 +140,7 @@ def _convert_to_inr_crore(value, unit, period, metric, cache):
     rate = _historical_inr_rate(currency, period, metric, cache)
     if rate is None:
         return None, "Historical rate unavailable"
-    return amount * scale * rate / 10000000, "Converted to INR crore"
+    return amount * scale * rate, "Converted to INR crore"
 
 def _infer_period(lines, line_index=None):
     """Prefer explicit statement date headers near the metric row."""
