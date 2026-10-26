@@ -294,60 +294,85 @@ def extract_with_ai(client, company, pages):
     return results
 
 def build_summary_table(df):
-    """Show one company-level row, prioritising the latest explicit reporting period."""
+    """Show one selected figure per metric, while keeping all candidates in the details table."""
     columns = ["Company", "Period"] + METRICS
     if df.empty:
         return pd.DataFrame(columns=columns)
 
     working = df.copy()
-    # Avoid one summary row per unrelated date found throughout the report.
-    years = working["period"].astype(str).str.findall(r"20\d{2}")
-    working["_period_year"] = years.apply(lambda values: max(map(int, values)) if values else 0)
+    years = working["period"].astype(str).str.findall(r"20\\d{2}")
+    working["_period_year"] = years.apply(
+        lambda values: max(map(int, values)) if values else 0
+    )
     company = str(working.iloc[0].get("company", ""))
     best_year = int(working["_period_year"].max())
     current = working[working["_period_year"] == best_year] if best_year else working
-    period_values = [p for p in current["period"].astype(str).unique() if p and p != "Not identified"]
-    period = period_values[0] if len(period_values) == 1 else (f"Latest identified year: {best_year}" if best_year else "Not identified")
+    period_values = [
+        p for p in current["period"].astype(str).unique()
+        if p and p not in {"Not identified", "Period unclear"}
+    ]
+    period = (
+        period_values[0] if len(period_values) == 1
+        else (f"Latest identified year: {best_year}" if best_year else "Not identified")
+    )
+
+    # Ranking chooses one candidate for the summary only. Every candidate and its
+    # evidence remains available in the detailed table and Excel export.
+    preferred_labels = {
+        "Revenue": [
+            "revenue from operations",
+            "revenue from contracts with customers",
+            "total revenue",
+        ],
+        "Profit After Tax": [
+            "profit after tax",
+            "profit for the year attributable to owners",
+            "net profit after tax",
+        ],
+        "Total Assets": ["total assets"],
+        "Total Liabilities": ["total liabilities"],
+        "Total Borrowings": ["total borrowings"],
+        "Cash and Cash Equivalents": ["cash and cash equivalents"],
+    }
 
     row = {"Company": company, "Period": period}
     for metric in METRICS:
         candidates = current[current["metric"] == metric].copy()
-        # If the latest-period filter excludes a metric because its period
-        # could not be confidently detected, fall back to its extracted
-        # candidates instead of incorrectly reporting "Not found".
         if candidates.empty:
-            candidates = working[working["metric"] == metric].copy()
-        # Prefer explicit balance-sheet / income-statement labels over broad
-        # labels, and do not display duplicates as if they were a single answer.
-        if not candidates.empty:
-            candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
-                lambda label: 0 if label in {
-                    "revenue from operations", "profit after tax", "total assets",
-                    "total liabilities", "cash and cash equivalents", "total borrowings"
-                } else 1
-            )
-            candidates = candidates.sort_values(
-                ["_label_rank", "pdf_page"], ascending=[True, True]
-            )
-        unique = []
-        for _, candidate in candidates.iterrows():
-            value = str(candidate.get("value", "")).strip()
-            unit = str(candidate.get("unit", "")).strip()
-            if not value or value.lower() == "nan":
-                continue
-            if not unit or unit.lower() == "nan":
-                unit = "Unit not identified"
-            display = f"{value} ({unit})"
-            if display not in unique:
-                unique.append(display)
-        if not unique:
             row[metric] = "Not found"
-        elif len(unique) == 1:
-            row[metric] = unique[0]
-        else:
-            row[metric] = "Review required: " + " | ".join(unique[:3])
-    return pd.DataFrame([row], columns=columns)
+            continue
 
+        candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
+            lambda label: (
+                preferred_labels[metric].index(label)
+                if label in preferred_labels[metric]
+                else len(preferred_labels[metric])
+            )
+        )
+        candidates["_unit_rank"] = candidates["unit"].astype(str).map(
+            lambda unit: 1 if unit == "Unit not identified" else 0
+        )
+        candidates["_period_rank"] = candidates["period"].astype(str).map(
+            lambda value: 1 if value in {"Period unclear", "Not identified"} else 0
+        )
+        candidates = candidates.sort_values(
+            ["_label_rank", "_period_rank", "_unit_rank", "pdf_page"],
+            ascending=[True, True, True, True],
+            kind="stable",
+        )
+
+        selected = candidates.iloc[0]
+        value = str(selected.get("value", "")).strip()
+        unit = str(selected.get("unit", "")).strip()
+        if not value or value.lower() == "nan":
+            row[metric] = "Not found"
+            continue
+        if not unit or unit.lower() == "nan":
+            unit = "Unit not identified"
+
+        # Mark the value as a candidate rather than implying automated verification.
+        row[metric] = f"{value} ({unit})"
+    return pd.DataFrame([row], columns=columns)
 
 def reconciliation(df):
     """Create actionable review flags without calling every repeated row a duplicate."""
