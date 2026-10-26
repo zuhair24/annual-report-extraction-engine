@@ -481,7 +481,7 @@ def extract_with_ai(client, company, pages):
     return results
 
 def build_summary_table(df):
-    """Show one selected figure per metric, with one shared reporting-period column."""
+    """Show separate summary rows for consolidated and standalone statements."""
     columns = ["Company", "Statement Type", "Period"] + METRICS
     if df.empty:
         return pd.DataFrame(columns=columns)
@@ -494,72 +494,68 @@ def build_summary_table(df):
     company = str(working.iloc[0].get("company", ""))
 
     preferred_labels = {
-        "Revenue": [
-            "revenue from operations",
-            "revenue from contracts with customers",
-            "total revenue",
-        ],
-        "Profit After Tax": [
-            "profit after tax",
-            "profit for the year attributable to owners",
-            "net profit after tax",
-        ],
+        "Revenue": ["revenue from operations", "revenue from contracts with customers", "total revenue"],
+        "Profit After Tax": ["profit after tax", "profit for the year attributable to owners", "net profit after tax"],
         "Total Assets": ["total assets"],
         "Total Liabilities": ["total liabilities"],
         "Total Borrowings": ["total borrowings"],
         "Cash and Cash Equivalents": ["cash and cash equivalents"],
     }
 
-    statement_types = (
-        working["statement_type"].fillna("Statement type unclear").astype(str).drop_duplicates().tolist()
-        if "statement_type" in working.columns else ["Statement type unclear"]
-    )
+    if "statement_type" in working.columns:
+        statement_types = (
+            working["statement_type"].fillna("Statement type unclear").astype(str).drop_duplicates().tolist()
+        )
+    else:
+        statement_types = ["Statement type unclear"]
+
     summary_rows = []
     for statement_type in statement_types:
         row = {"Company": company, "Statement Type": statement_type}
         selected_periods = []
+
         for metric in METRICS:
             candidates = working[working["metric"] == metric].copy()
             if "statement_type" in candidates.columns:
                 candidates = candidates[
                     candidates["statement_type"].fillna("Statement type unclear").astype(str) == statement_type
                 ]
-        if candidates.empty:
-            row[metric] = "Not found"
-            continue
+            if candidates.empty:
+                row[metric] = "Not found"
+                continue
 
-        candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
-            lambda label: (
-                preferred_labels[metric].index(label)
-                if label in preferred_labels[metric]
-                else len(preferred_labels[metric])
+            candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
+                lambda label: (
+                    preferred_labels[metric].index(label)
+                    if label in preferred_labels[metric]
+                    else len(preferred_labels[metric])
+                )
             )
-        )
-        candidates["_period_rank"] = candidates["period"].astype(str).map(
-            lambda value: 1 if value in {"Period unclear", "Not identified"} else 0
-        )
-        candidates["_unit_rank"] = candidates["unit"].astype(str).map(
-            lambda unit: 1 if unit in {"Unit not identified", "", "nan"} else 0
-        )
-        candidates = candidates.sort_values(
-            ["_period_rank", "_period_year", "_label_rank", "_unit_rank", "pdf_page"],
-            ascending=[True, False, True, True, True],
-            kind="stable",
-        )
+            candidates["_period_rank"] = candidates["period"].astype(str).map(
+                lambda value: 1 if value in {"Period unclear", "Not identified"} else 0
+            )
+            candidates["_unit_rank"] = candidates["unit"].astype(str).map(
+                lambda unit: 1 if unit in {"Unit not identified", "", "nan"} else 0
+            )
+            candidates = candidates.sort_values(
+                ["_period_rank", "_period_year", "_label_rank", "_unit_rank", "pdf_page"],
+                ascending=[True, False, True, True, True],
+                kind="stable",
+            )
 
-        selected = candidates.iloc[0]
-        converted = selected.get("value_inr_crore")
-        period = str(selected.get("period", "")).strip()
+            selected = candidates.iloc[0]
+            converted = selected.get("value_inr_crore")
+            period = str(selected.get("period", "")).strip()
 
-        if pd.isna(converted):
-            row[metric] = "Conversion unavailable; review"
-        else:
-            row[metric] = f"₹ {converted:,.2f} crore"
+            if pd.isna(converted):
+                row[metric] = "Conversion unavailable; review"
+            else:
+                row[metric] = f"₹ {converted:,.2f} crore"
 
-        if period and period.lower() != "nan" and period not in {
-            "Period unclear", "Not identified"
-        }:
-            selected_periods.append(period)
+            if period and period.lower() != "nan" and period not in {
+                "Period unclear", "Not identified"
+            }:
+                selected_periods.append(period)
 
         unique_periods = list(dict.fromkeys(selected_periods))
         if len(unique_periods) == 1:
