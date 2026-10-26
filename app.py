@@ -161,7 +161,7 @@ def _infer_period(lines, line_index=None):
 
 
 def _extract_amounts(text):
-    """Find amounts while filtering dates and leaving note-number handling to the row parser."""
+    """Extract positive numeric table values; ignore percentages, dates, and dash placeholders."""
     text = re.sub(
         r"\(?\s*(?:refer to )?notes?\s*\d+[a-z]?\s*\)?",
         " ",
@@ -176,10 +176,15 @@ def _extract_amounts(text):
         text,
         flags=re.IGNORECASE,
     )
+    # Remove percentages before parsing numbers, so 6.6% is not treated as money.
+    text = re.sub(r"\(?\s*\d[\d,]*(?:\.\d+)?\s*%\s*\)?", " ", text)
+    # A dash in a financial table means no value, not a negative number.
+    text = re.sub(r"(?<!\w)[—–-](?!\w)", " ", text)
+
     number_pattern = re.compile(
         r"(?<![A-Za-z0-9/])"
         r"(?:₹\s*|Rs\.?\s*|INR\s*|USD\s*|\$\s*)?"
-        r"\(?\s*-?\s*\d[\d,]*(?:\.\d+)?\s*\)?"
+        r"\(?\s*\d[\d,]*(?:\.\d+)?\s*\)?"
         r"(?![A-Za-z0-9/])",
         re.IGNORECASE,
     )
@@ -188,7 +193,7 @@ def _extract_amounts(text):
         raw = match.group(0).strip()
         bare = re.sub(r"^(?:₹|Rs\.?|INR|USD|\$)\s*", "", raw, flags=re.IGNORECASE)
         bare = bare.strip().strip("()").replace(",", "").replace(" ", "")
-        if not bare or not re.fullmatch(r"-?\d+(?:\.\d+)?", bare):
+        if not bare or not re.fullmatch(r"\d+(?:\.\d+)?", bare):
             continue
         numeric = float(bare)
         if 1900 <= numeric <= 2099 and "." not in bare:
@@ -198,37 +203,40 @@ def _extract_amounts(text):
 
 
 def _row_amounts(lines, line_index, match_end):
-    """Read amounts only from a likely financial table row, rejecting narrative percentages."""
+    """Read at most two comparable values from a labelled financial row."""
     label_line = lines[line_index]
     suffix = label_line[match_end:]
-    # Reject prose/growth callouts such as "REVENUE ↑ 7.9%" and rows with
-    # percentages, which are not the requested currency amounts.
-    if re.search(r"[↑↓%]|\b(?:growth|increase|decrease|margin|同比)\b", label_line, re.IGNORECASE):
+    # Percentages are removed by _extract_amounts; reject explicit growth prose,
+    # but allow a normal financial row that also reports a growth percentage.
+    if re.search(r"\b(?:growth|increase|decrease|margin|同比)\b", label_line, re.IGNORECASE):
         return [], label_line
-    same_line = _extract_amounts(suffix)
+
+    amounts = _extract_amounts(suffix)
     evidence_lines = [label_line]
-    amounts = same_line
 
     if not amounts:
-        following = []
-        for next_line in lines[line_index + 1:line_index + 7]:
-            # A numeric-only line may be a note number or a financial column.
+        # In some PDFs the label and its numeric columns are on adjacent lines.
+        # Read only the first following numeric-only line to avoid swallowing
+        # values from several unrelated rows below the label.
+        for next_line in lines[line_index + 1:line_index + 4]:
+            if not next_line.strip():
+                continue
             if re.search(r"[A-Za-z]{2,}", next_line):
                 break
-            if next_line.strip():
-                following.append(next_line.strip())
-        if following:
-            amounts = _extract_amounts(" ".join(following))
-            evidence_lines.extend(following)
+            next_amounts = _extract_amounts(next_line)
+            if next_amounts:
+                amounts = next_amounts
+                evidence_lines.append(next_line.strip())
+                break
 
-    # Annual-report tables commonly place a note reference (e.g. 25) before
-    # current-year and prior-year values. If three or more numbers exist and
-    # the first is a small integer, treat it as the note reference.
-    if len(amounts) >= 3:
-        first = amounts[0][1]
-        if re.fullmatch(r"\d{1,2}", first):
-            amounts = amounts[1:]
+    # If the first small integer is a note reference, remove it before limiting
+    # the row to the current and comparative values.
+    if len(amounts) >= 3 and re.fullmatch(r"\d{1,2}", amounts[0][1]):
+        amounts = amounts[1:]
 
+    # This prototype only retains the two most plausible table columns.
+    # Extra numbers are not silently treated as additional financial periods.
+    amounts = amounts[:2]
     return amounts, " | ".join(evidence_lines)
 
 
