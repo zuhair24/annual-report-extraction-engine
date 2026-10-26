@@ -227,7 +227,11 @@ def extract_with_ai(client, company, pages):
                         period_for_values = ["Period unclear"] * len(amounts)
 
                     for amount_index, (raw_value, value) in enumerate(amounts):
-                        candidate_period = period_for_values[amount_index]
+                        candidate_period = (
+                            period_for_values[amount_index]
+                            if amount_index < len(period_for_values)
+                            else "Period unclear"
+                        )
                         key = (page_num, metric, value, candidate_period, evidence_line)
                         if key in seen:
                             continue
