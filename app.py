@@ -294,12 +294,8 @@ def extract_with_ai(client, company, pages):
     return results
 
 def build_summary_table(df):
-    """Show one selected figure per metric with its own unit and reporting period."""
-    columns = ["Company"] + [
-        column
-        for metric in METRICS
-        for column in (metric, f"{metric} Unit", f"{metric} Period")
-    ]
+    """Show one selected figure per metric, with one shared reporting-period column."""
+    columns = ["Company", "Period"] + METRICS
     if df.empty:
         return pd.DataFrame(columns=columns)
 
@@ -328,16 +324,13 @@ def build_summary_table(df):
     }
 
     row = {"Company": company}
+    selected_periods = []
     for metric in METRICS:
         candidates = working[working["metric"] == metric].copy()
         if candidates.empty:
             row[metric] = "Not found"
-            row[f"{metric} Unit"] = "Not identified"
-            row[f"{metric} Period"] = "Not identified"
             continue
 
-        # Prefer a candidate with a clear period, then the latest period,
-        # the standard label, a detected unit, and finally the earliest page.
         candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
             lambda label: (
                 preferred_labels[metric].index(label)
@@ -362,13 +355,25 @@ def build_summary_table(df):
         unit = str(selected.get("unit", "")).strip()
         period = str(selected.get("period", "")).strip()
 
-        row[metric] = value if value and value.lower() != "nan" else "Not found"
-        row[f"{metric} Unit"] = (
-            unit if unit and unit.lower() != "nan" else "Unit not identified"
-        )
-        row[f"{metric} Period"] = (
-            period if period and period.lower() != "nan" else "Not identified"
-        )
+        if not value or value.lower() == "nan":
+            row[metric] = "Not found"
+        else:
+            if not unit or unit.lower() == "nan":
+                unit = "Unit not identified"
+            row[metric] = f"{value} ({unit})"
+
+        if period and period.lower() != "nan" and period not in {
+            "Period unclear", "Not identified"
+        }:
+            selected_periods.append(period)
+
+    unique_periods = list(dict.fromkeys(selected_periods))
+    if len(unique_periods) == 1:
+        row["Period"] = unique_periods[0]
+    elif len(unique_periods) > 1:
+        row["Period"] = "Mixed periods; review required"
+    else:
+        row["Period"] = "Not identified"
 
     return pd.DataFrame([row], columns=columns)
 
@@ -502,9 +507,9 @@ if uploaded is not None and company.strip():
             else:
                 st.subheader("Extracted figures summary")
                 st.caption(
-                    "One selected candidate per metric. Each metric has separate "
-                    "value, unit, and reporting-period columns. Check the source "
-                    "evidence before relying on any extracted figure."
+                    "One selected candidate per metric. Units appear beside each "
+                    "value, with one shared reporting-period column for the table. "
+                    "Check the source evidence before relying on any extracted figure."
                 )
                 summary_df = build_summary_table(df)
                 st.dataframe(
