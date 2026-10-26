@@ -319,10 +319,9 @@ def _row_amounts(lines, line_index, match_end):
     """Read at most two comparable values from a labelled financial row."""
     label_line = lines[line_index]
     suffix = label_line[match_end:]
-    # Percentages are removed by _extract_amounts; reject explicit growth prose,
-    # but allow a normal financial row that also reports a growth percentage.
-    if re.search(r"\b(?:growth|increase|decrease|margin|同比)\b", label_line, re.IGNORECASE):
-        return [], label_line
+    # Keep ordinary financial rows even when they mention growth, increases,
+    # decreases, or margins. _extract_amounts removes percentage figures first,
+    # so valid financial amounts can still be considered.
 
     amounts = _extract_amounts(suffix)
     evidence_lines = [label_line]
