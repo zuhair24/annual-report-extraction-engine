@@ -294,30 +294,22 @@ def extract_with_ai(client, company, pages):
     return results
 
 def build_summary_table(df):
-    """Show one selected figure per metric, while keeping all candidates in the details table."""
-    columns = ["Company", "Period"] + METRICS
+    """Show one selected figure per metric with its own unit and reporting period."""
+    columns = ["Company"] + [
+        column
+        for metric in METRICS
+        for column in (metric, f"{metric} Unit", f"{metric} Period")
+    ]
     if df.empty:
         return pd.DataFrame(columns=columns)
 
     working = df.copy()
-    years = working["period"].astype(str).str.findall(r"20\\d{2}")
+    years = working["period"].astype(str).str.findall(r"20\d{2}")
     working["_period_year"] = years.apply(
         lambda values: max(map(int, values)) if values else 0
     )
     company = str(working.iloc[0].get("company", ""))
-    best_year = int(working["_period_year"].max())
-    current = working[working["_period_year"] == best_year] if best_year else working
-    period_values = [
-        p for p in current["period"].astype(str).unique()
-        if p and p not in {"Not identified", "Period unclear"}
-    ]
-    period = (
-        period_values[0] if len(period_values) == 1
-        else (f"Latest identified year: {best_year}" if best_year else "Not identified")
-    )
 
-    # Ranking chooses one candidate for the summary only. Every candidate and its
-    # evidence remains available in the detailed table and Excel export.
     preferred_labels = {
         "Revenue": [
             "revenue from operations",
@@ -335,13 +327,17 @@ def build_summary_table(df):
         "Cash and Cash Equivalents": ["cash and cash equivalents"],
     }
 
-    row = {"Company": company, "Period": period}
+    row = {"Company": company}
     for metric in METRICS:
-        candidates = current[current["metric"] == metric].copy()
+        candidates = working[working["metric"] == metric].copy()
         if candidates.empty:
             row[metric] = "Not found"
+            row[f"{metric} Unit"] = "Not identified"
+            row[f"{metric} Period"] = "Not identified"
             continue
 
+        # Prefer a candidate with a clear period, then the latest period,
+        # the standard label, a detected unit, and finally the earliest page.
         candidates["_label_rank"] = candidates["reported_label"].astype(str).str.lower().map(
             lambda label: (
                 preferred_labels[metric].index(label)
@@ -349,29 +345,31 @@ def build_summary_table(df):
                 else len(preferred_labels[metric])
             )
         )
-        candidates["_unit_rank"] = candidates["unit"].astype(str).map(
-            lambda unit: 1 if unit == "Unit not identified" else 0
-        )
         candidates["_period_rank"] = candidates["period"].astype(str).map(
             lambda value: 1 if value in {"Period unclear", "Not identified"} else 0
         )
+        candidates["_unit_rank"] = candidates["unit"].astype(str).map(
+            lambda unit: 1 if unit in {"Unit not identified", "", "nan"} else 0
+        )
         candidates = candidates.sort_values(
-            ["_label_rank", "_period_rank", "_unit_rank", "pdf_page"],
-            ascending=[True, True, True, True],
+            ["_period_rank", "_period_year", "_label_rank", "_unit_rank", "pdf_page"],
+            ascending=[True, False, True, True, True],
             kind="stable",
         )
 
         selected = candidates.iloc[0]
         value = str(selected.get("value", "")).strip()
         unit = str(selected.get("unit", "")).strip()
-        if not value or value.lower() == "nan":
-            row[metric] = "Not found"
-            continue
-        if not unit or unit.lower() == "nan":
-            unit = "Unit not identified"
+        period = str(selected.get("period", "")).strip()
 
-        # Mark the value as a candidate rather than implying automated verification.
-        row[metric] = f"{value} ({unit})"
+        row[metric] = value if value and value.lower() != "nan" else "Not found"
+        row[f"{metric} Unit"] = (
+            unit if unit and unit.lower() != "nan" else "Unit not identified"
+        )
+        row[f"{metric} Period"] = (
+            period if period and period.lower() != "nan" else "Not identified"
+        )
+
     return pd.DataFrame([row], columns=columns)
 
 def reconciliation(df):
@@ -504,10 +502,9 @@ if uploaded is not None and company.strip():
             else:
                 st.subheader("Extracted figures summary")
                 st.caption(
-                    "One row per company and reporting period. Each financial "
-                    "metric has its own column; values include detected units. "
-                    "'Not found' means no candidate was extracted, while "
-                    "'Multiple candidates' means the figures need review."
+                    "One selected candidate per metric. Each metric has separate "
+                    "value, unit, and reporting-period columns. Check the source "
+                    "evidence before relying on any extracted figure."
                 )
                 summary_df = build_summary_table(df)
                 st.dataframe(
